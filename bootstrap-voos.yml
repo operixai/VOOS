@@ -1,0 +1,334 @@
+name: Bootstrap VOOS from OpenClaw source
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: OpenClaw branch, tag, or commit to import
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voos-source-import
+  cancel-in-progress: false
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out VOOS
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Prepare and integrate OpenClaw source
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rsync
+
+          # Resolve the requested upstream ref to an immutable commit, then
+          # download the source snapshot only (no Git history or node_modules).
+          UPSTREAM_SHA="$(curl --fail --silent --show-error --location --retry 3 \
+            "https://api.github.com/repos/openclaw/openclaw/commits/${UPSTREAM_REF}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "Could not resolve OpenClaw ref: ${UPSTREAM_REF}" >&2
+            exit 1
+          fi
+
+          mkdir -p /tmp/openclaw-source
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "https://codeload.github.com/openclaw/openclaw/tar.gz/${UPSTREAM_SHA}" \
+            --output /tmp/openclaw.tar.gz
+          tar -xzf /tmp/openclaw.tar.gz --strip-components=1 -C /tmp/openclaw-source
+
+          mkdir -p /tmp/voos-upstream docs/upstream voos/scripts
+          cp /tmp/openclaw-source/README.md /tmp/openclaw-readme.md
+
+          # Copy the actual OpenClaw source into VOOS root. Keep this VOOS
+          # workflow (and other local workflows); no submodule or installer.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            /tmp/openclaw-source/ "$GITHUB_WORKSPACE/"
+
+          mkdir -p docs/upstream voos/scripts ui/src/pages/chat
+          cp /tmp/openclaw-readme.md docs/upstream/OPENCLAW-README.md
+          printf '%s\n' "$UPSTREAM_SHA" > voos/UPSTREAM_COMMIT
+
+          cat > ui/src/pages/chat/voos-voice-dock.tsx <<'EOF'
+          import { createSignal, Show } from "solid-js";
+          import "./voos-voice-dock.css";
+
+          type VoosVoiceDockProps = {
+            onToggleVoice?: (() => void) | undefined;
+          };
+
+          export function VoosVoiceDock(props: VoosVoiceDockProps) {
+            const [open, setOpen] = createSignal(false);
+            const canToggle = () => typeof props.onToggleVoice === "function";
+
+            return (
+              <>
+                <button
+                  class="voos-voice-launcher"
+                  type="button"
+                  aria-label="Open VOOS voice controls"
+                  aria-haspopup="dialog"
+                  onClick={() => setOpen(true)}
+                >
+                  <span class="voos-voice-launcher__orb" aria-hidden="true"><span /></span>
+                  <span class="voos-voice-launcher__label">
+                    <strong>VOOS</strong>
+                    <small>VOICE</small>
+                  </span>
+                  <span class="voos-voice-launcher__indicator" aria-hidden="true" />
+                </button>
+
+                <Show when={open()}>
+                  <div class="voos-voice-overlay">
+                    <button
+                      class="voos-voice-overlay__backdrop"
+                      type="button"
+                      aria-label="Close VOOS voice controls"
+                      onClick={() => setOpen(false)}
+                    />
+                    <section
+                      class="voos-voice-panel"
+                      role="dialog"
+                      aria-modal="true"
+                      aria-label="VOOS voice workspace"
+                    >
+                      <header class="voos-voice-panel__header">
+                        <div>
+                          <span class="voos-voice-eyebrow">VOOS / LIVE WORKSPACE</span>
+                          <h2>Voice control</h2>
+                        </div>
+                        <button
+                          class="voos-voice-panel__close"
+                          type="button"
+                          aria-label="Close voice workspace"
+                          onClick={() => setOpen(false)}
+                        >
+                          ×
+                        </button>
+                      </header>
+
+                      <div class="voos-voice-visual" aria-hidden="true">
+                        <span class="voos-voice-visual__ring voos-voice-visual__ring--outer" />
+                        <span class="voos-voice-visual__ring voos-voice-visual__ring--inner" />
+                        <span class="voos-voice-visual__core"><span /></span>
+                      </div>
+
+                      <span class="voos-voice-eyebrow">YOUR CURRENT CONVERSATION</span>
+                      <h3>Speak naturally.</h3>
+                      <p class="voos-voice-panel__description">
+                        This control uses the existing chat's native Talk callback. Voice stays in
+                        the active agent context and follows the same tools and permission gates.
+                        It does not create a second gateway or agent session.
+                      </p>
+
+                      <button
+                        class="voos-voice-panel__action"
+                        type="button"
+                        disabled={!canToggle()}
+                        onClick={() => props.onToggleVoice?.()}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none">
+                          <rect x="9" y="2.5" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.7" />
+                          <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3.5M8.5 21.5h7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                        </svg>
+                        Toggle native voice session
+                      </button>
+                      <p class="voos-voice-panel__note">
+                        {canToggle()
+                          ? "Live connection status remains owned by the native chat runtime."
+                          : "Voice control is unavailable in this chat view."}
+                      </p>
+                      <p class="voos-voice-panel__safety">
+                        Computer actions still follow the active tool policy and approval prompts.
+                      </p>
+                    </section>
+                  </div>
+                </Show>
+              </>
+            );
+          }
+          EOF
+
+          cat > ui/src/pages/chat/voos-voice-dock.css <<'EOF'
+          .voos-voice-launcher {
+            position: fixed;
+            z-index: 1200;
+            right: max(22px, env(safe-area-inset-right));
+            bottom: max(22px, env(safe-area-inset-bottom));
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-height: 56px;
+            padding: 8px 15px 8px 9px;
+            color: #f7f7f8;
+            background: rgba(17, 17, 20, .94);
+            border: 1px solid rgba(255, 255, 255, .16);
+            border-radius: 999px;
+            box-shadow: 0 10px 38px rgba(0, 0, 0, .28), inset 0 1px 0 rgba(255,255,255,.05);
+            cursor: pointer;
+            backdrop-filter: blur(18px);
+          }
+          .voos-voice-launcher:hover { border-color: rgba(255, 70, 82, .68); }
+          .voos-voice-launcher__orb {
+            width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+            background: radial-gradient(circle at 35% 25%, #ff8b92, #e52d3d 48%, #73111e 100%);
+            box-shadow: 0 0 22px rgba(239, 42, 60, .28);
+          }
+          .voos-voice-launcher__orb span { width: 9px; height: 9px; border-radius: 50%; background: #fff; box-shadow: 0 0 12px #fff; }
+          .voos-voice-launcher__label { display: grid; gap: 1px; text-align: left; line-height: 1; }
+          .voos-voice-launcher__label strong { font-size: 12px; letter-spacing: .17em; }
+          .voos-voice-launcher__label small { color: #b9b9c0; font-size: 9px; letter-spacing: .2em; }
+          .voos-voice-launcher__indicator { width: 6px; height: 6px; margin-left: 2px; border-radius: 50%; background: #f04a57; }
+          .voos-voice-overlay { position: fixed; inset: 0; z-index: 1300; display: grid; place-items: center; padding: 20px; }
+          .voos-voice-overlay__backdrop { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: rgba(3,3,5,.75); backdrop-filter: blur(14px); cursor: default; }
+          .voos-voice-panel { position: relative; width: min(100%, 540px); max-height: min(90vh, 820px); overflow: auto; padding: clamp(24px, 5vw, 42px); color: #f6f6f7; background: radial-gradient(ellipse at 50% 25%, rgba(120,20,32,.23), transparent 47%), #111114; border: 1px solid rgba(255,255,255,.12); border-radius: 28px; box-shadow: 0 34px 120px rgba(0,0,0,.54); }
+          .voos-voice-panel__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+          .voos-voice-eyebrow { display: block; color: #f06a75; font-size: 10px; font-weight: 700; letter-spacing: .18em; line-height: 1.5; }
+          .voos-voice-panel__header h2 { margin: 7px 0 0; font-size: 22px; font-weight: 600; letter-spacing: -.03em; }
+          .voos-voice-panel__close { display: grid; place-items: center; width: 36px; height: 36px; flex: 0 0 auto; color: #ddd; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); border-radius: 50%; font-size: 25px; cursor: pointer; }
+          .voos-voice-visual { position: relative; display: grid; place-items: center; height: 212px; margin: 12px 0 10px; }
+          .voos-voice-visual__ring { position: absolute; display: block; border: 1px solid rgba(245,65,80,.19); border-radius: 50%; }
+          .voos-voice-visual__ring--outer { width: 184px; height: 184px; box-shadow: 0 0 55px rgba(224,31,53,.06); }
+          .voos-voice-visual__ring--inner { width: 132px; height: 132px; border-color: rgba(245,65,80,.3); }
+          .voos-voice-visual__core { position: relative; display: grid; place-items: center; width: 88px; height: 88px; border-radius: 50%; background: radial-gradient(circle at 32% 24%, #ff9ca3, #ed3547 42%, #6b0d19 100%); box-shadow: 0 0 65px rgba(234,44,61,.24), inset 0 1px 4px rgba(255,255,255,.55); }
+          .voos-voice-visual__core span { width: 19px; height: 19px; border: 2px solid white; border-radius: 50%; box-shadow: 0 0 15px rgba(255,255,255,.5); }
+          .voos-voice-panel h3 { margin: 10px 0 8px; font-size: clamp(27px, 5vw, 34px); font-weight: 600; letter-spacing: -.045em; }
+          .voos-voice-panel__description { margin: 0; color: #b9b9c2; font-size: 14px; line-height: 1.65; }
+          .voos-voice-panel__action { display: flex; justify-content: center; align-items: center; gap: 10px; width: 100%; min-height: 52px; margin-top: 24px; padding: 12px 18px; color: #fff; background: #e52d3d; border: 1px solid rgba(255,255,255,.12); border-radius: 14px; font-size: 14px; font-weight: 650; cursor: pointer; transition: background .15s ease, transform .15s ease; }
+          .voos-voice-panel__action:hover:not(:disabled) { background: #f24150; transform: translateY(-1px); }
+          .voos-voice-panel__action:disabled { opacity: .42; cursor: not-allowed; }
+          .voos-voice-panel__action svg { width: 20px; height: 20px; }
+          .voos-voice-panel__note, .voos-voice-panel__safety { color: #9999a3; font-size: 11px; line-height: 1.5; text-align: center; }
+          .voos-voice-panel__note { margin: 12px 0 0; }
+          .voos-voice-panel__safety { margin: 6px 0 0; color: #777781; }
+          @media (max-width: 480px) { .voos-voice-launcher { right: 14px; bottom: 14px; } .voos-voice-overlay { padding: 10px; } .voos-voice-panel { border-radius: 22px; } .voos-voice-visual { height: 175px; } .voos-voice-visual__ring--outer { width: 160px; height: 160px; } }
+          @media (prefers-reduced-motion: reduce) { .voos-voice-panel__action { transition: none; } }
+          EOF
+
+          cat > voos/scripts/apply-ui-integration.mjs <<'EOF'
+          import fs from "node:fs/promises";
+          import path from "node:path";
+          import { fileURLToPath } from "node:url";
+
+          const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+          const target = path.join(root, "ui/src/pages/chat/chat-view.tsx");
+          let source = await fs.readFile(target, "utf8");
+          if (source.includes("VoosVoiceDock")) {
+            console.log("VOOS voice dock is already mounted.");
+            process.exit(0);
+          }
+
+          const importAnchor = 'import { Icon } from "../../components/solid/icon.tsx";';
+          if (!source.includes(importAnchor)) {
+            throw new Error("Could not find the expected native chat import anchor; upstream UI may have changed.");
+          }
+          source = source.replace(importAnchor, `${importAnchor}\nimport { VoosVoiceDock } from "./voos-voice-dock.tsx";`);
+
+          const mountAnchor = "    </section>\n  );\n}";
+          const mountIndex = source.lastIndexOf(mountAnchor);
+          if (mountIndex < 0) {
+            throw new Error("Could not find the ChatView root section; refusing to patch an unknown UI layout.");
+          }
+          const mount = '      <VoosVoiceDock onToggleVoice={input.props.suggestionComposer ? undefined : input.props.onToggleRealtimeTalk} />\n';
+          source = source.slice(0, mountIndex) + mount + source.slice(mountIndex);
+          await fs.writeFile(target, source, "utf8");
+          console.log("Mounted VOOS voice dock on the existing ChatView Talk callback.");
+          EOF
+
+          cat > voos/ARCHITECTURE.md <<'EOF'
+          # VOOS architecture and integration rules
+
+          1. **Single runtime:** the OpenClaw runtime lives in this repository root; do not spawn a second OpenClaw installation or gateway.
+          2. **Single conversation:** VOOS voice controls call the existing chat's native Talk callback and preserve its active agent context, tool runner and permission policy.
+          3. **Preserve approvals:** voice input does not bypass exec approvals, OS permissions, browser capabilities or confirmation flows. Keep destructive actions and external side effects gated by the existing policy.
+          4. **Local-first memory:** define explicit ownership between runtime memory and the Obsidian vault. Preserve source/provenance and handle conflicts; never silently overwrite notes.
+          5. **Secrets stay local:** no API keys, access tokens, or personal vault contents belong in source control.
+          6. **Trace upstream:** the exact OpenClaw commit is recorded in `voos/UPSTREAM_COMMIT`; retain the upstream MIT license and copyright notices.
+
+          ## Obsidian target
+
+          Implement a bounded, path-safe adapter for the user-configured vault: title/content search, Markdown read, explicit create/update, wikilinks and frontmatter preservation, provenance, and clear errors. Default to read-only until writes are enabled. Confirm before deletion, moves, bulk edits, and overwrites of changed files. The bundled `memory-wiki` feature is a knowledge-wiki layer, not by itself a full Obsidian vault adapter.
+          EOF
+
+          cat > voos/OBSIDIAN.md <<'EOF'
+          # Obsidian integration status
+
+          This document is the implementation target, not a claim that vault read/write is already complete.
+
+          - Configure an explicit local vault path; never hardcode a personal path.
+          - Search note titles and Markdown content; read notes and resolve `[[wikilinks]]` conservatively.
+          - Create a note only after an explicit user request; update a section without replacing unrelated content.
+          - Preserve YAML frontmatter, tags, links, attachments and Obsidian folder structure.
+          - Record note path, title, modified time and provenance when promoting content to long-term assistant memory.
+          - Canonicalize every path and reject traversal/symlinks escaping the vault root.
+          - Default to read-only. Confirm overwrites, deletions, moves and multi-file changes.
+          - Keep normal runtime memory working if Obsidian is closed or unavailable.
+          - Never commit or remotely sync vault contents by default.
+          EOF
+
+          cat > README.md <<'EOF'
+          # VOOS — Voice Operating System
+
+          VOOS is being built as one integrated, voice-first desktop AI workspace on top of the OpenClaw source tree. This repository contains the actual runtime source, not an installer that launches a separate OpenClaw instance.
+
+          ## Architecture
+
+          - One runtime, one active conversation/session and one tool-permission model.
+          - VOOS voice controls are mounted in the native chat and reuse its existing Talk callback.
+          - Voice does not bypass OS capabilities or tool approval gates.
+          - Obsidian vault support is a separate integration milestone; see `voos/OBSIDIAN.md`.
+          - The imported OpenClaw source commit is recorded in `voos/UPSTREAM_COMMIT`.
+
+          ## Source and license
+
+          OpenClaw source and its MIT license/copyright notices are retained in this tree. See `LICENSE` and `docs/upstream/OPENCLAW-README.md`.
+
+          ## Development status
+
+          This bootstrap imports source and adds the first native voice-control surface. It does **not** mean Windows computer-control or Obsidian read/write has been fully validated. Check GitHub Actions build output before relying on the result. No credentials or private vault data should be committed.
+          EOF
+
+          node voos/scripts/apply-ui-integration.mjs
+
+      - name: Commit integrated source to VOOS
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed; source tree is already imported."
+            exit 0
+          fi
+          git commit -m "feat(voos): import OpenClaw source and integrate native voice dock"
+          git push origin HEAD:main
+
+      - name: Verify install and build
+        continue-on-error: true
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install and build
+        continue-on-error: true
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm build
